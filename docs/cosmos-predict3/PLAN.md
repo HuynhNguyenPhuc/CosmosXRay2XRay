@@ -90,6 +90,12 @@ constructs them from the real published `nvidia/Cosmos3-Edge` config (not invent
      structured-JSON `captions.jsonl`), analogous to the conversion already scoped in `CosmosXRay360`.
   2. Write a TOML SFT recipe selecting only the generator-side keys for training
      (`moe_gen`, `time_embedder`, `vae2llm`, `llm2vae`) so the causal AR Reasoner tower stays frozen.
+     > **Correction (2026-08-18):** those four names are secondhand from `CosmosXRay360` and do **not**
+     > match the `diffusers` implementation this repo actually trains against. Only `time_embedder`
+     > exists verbatim; `moe_gen` is a *suffix* (`mlp_moe_gen`, `norm_moe_gen`, …) not a module, and the
+     > latent↔hidden projections are `proj_in`/`proj_out`. The verified split is implemented in
+     > `predict3/tower.py` and documented in §10 — use that, not this list. The names above may still
+     > be correct for `cosmos-framework`'s own checkpoint layout, which is a separate naming scheme.
   3. Re-derive the physical regularizers (view-angle consistency, attenuation mass conservation) against
      Cosmos 3's velocity-prediction formulation and the Wan 2.2 VAE's 16×16 latent grid (for a 256×256 frame).
   4. Only then create `predict3/` (or fold it into `predict2_5/` as a backend switch) as real code.
@@ -368,3 +374,71 @@ began allocating after §8.2's fix). `num_hidden_layers_override` (default 2 in 
 `--layers 0` for real depth) shrinks **only** depth; hidden size, latent channels, patch size and
 mRoPE axes stay at their real published values, so the packing and wiring under test are unchanged.
 It is logged as a warning and must never be set for real training — pretrained weights would not load.
+
+## 10. Reasoner freeze — generator-only post-training (2026-08-18)
+
+`predict3/` now post-trains the **DM Generator tower** only and freezes the **AR Reasoner tower**
+(`freeze_reasoner=True`, the default on `CosmosXRay2XRayPredict3Multiview`). Implemented in
+`predict3/tower.py`; the cross-backbone conditioning context is in `docs/CONDITIONING.md` §4.
+
+### 10.1 Correction to §5's key list
+
+§5 named the trainable keys `moe_gen`, `time_embedder`, `vae2llm`, `llm2vae` — secondhand from
+`CosmosXRay360`, never checked against code. Enumerating the real
+`Cosmos3OmniTransformer.named_parameters()` shows only `time_embedder` exists verbatim:
+
+- `moe_gen` is a **suffix**, not a module — `mlp_moe_gen`, `norm_moe_gen`,
+  `input_layernorm_moe_gen`, `post_attention_layernorm_moe_gen`.
+- The latent↔hidden projections are `proj_in` / `proj_out`, not `vae2llm` / `llm2vae`.
+
+Had the §5 list been used literally as a parameter-name filter, it would have matched almost
+nothing and the run would have trained a near-empty parameter set. `freeze_reasoner_tower()` therefore
+raises if the split leaves zero trainable parameters, rather than proceeding quietly.
+
+### 10.2 The verified split
+
+| Tower | Top-level | Per-layer |
+| --- | --- | --- |
+| **Reasoner** (frozen) | `embed_tokens`, `lm_head`, `norm` | `self_attn.to_{q,k,v,out}`, `mlp.*`, `input_layernorm`, `post_attention_layernorm` |
+| **Generator** (trained) | `proj_in`, `proj_out`, `norm_moe_gen`, `time_embedder`, `action_proj_in`, `action_proj_out`, `action_modality_embed` | `*_moe_gen`, `self_attn.{add_q_proj,add_k_proj,add_v_proj,to_add_out}`, `norm_added_{q,k}`, `k_norm_und_for_gen` |
+
+Two names could not be settled by pattern-matching and required reading
+`Cosmos3AttnProcessor.__call__`:
+
+- **`k_norm_und_for_gen`** sits on the *und* key path but its output is consumed **only** by the
+  generation pathway (`all_k = cat([k_und_for_gen, k_gen])`); the causal pathway uses the
+  unnormalized `k_und`. It affects the generator's reading of und keys and nothing about the
+  reasoner's own output → **generator side, trainable**.
+- **`time_embedder`** carries no `_moe_gen` suffix but is the diffusion-timestep embedding, and
+  the causal AR tower has no timestep → **generator side, trainable**.
+
+### 10.3 Why freezing is safe here
+
+The towers are asymmetric: the causal pathway attends over `q_und`/`k_und`/`v_und` alone, so und
+activations never depend on gen activations. Freezing the reasoner cannot starve the generator of
+signal. The converse motivation also holds — fine-tuning a language/reasoning prior on a narrow
+DRR corpus would erode it for no benefit, since this pipeline never generates text.
+
+### 10.4 Measured split and verification
+
+On the real full-depth `nvidia/Cosmos3-Edge` config (28 layers, 3.37B):
+**1.42B trainable (42.2%) / 1.95B frozen (57.8%)**. The frozen share is large partly because the
+131k-vocab `embed_tokens` and `lm_head` (~268M each) are reasoner-side.
+
+Three tests in `tests/test_predict3.py` (10 passing total):
+
+- `test_reasoner_frozen_generator_trainable` — asserts the classification against real parameter
+  names and that the partition is **total and disjoint**, so an upstream rename surfaces as a
+  failure instead of silently-untrained weights.
+- `test_frozen_reasoner_receives_no_gradients` — `requires_grad=False` is weak evidence on its
+  own; this runs a real backward and asserts every parameter that accumulated a gradient is
+  generator-side, and that `configure_optimizers` excludes frozen params (which would otherwise
+  allocate AdamW state for weights that never update).
+- `test_freeze_can_be_disabled` — full fine-tuning remains available via `freeze_reasoner=False`.
+
+### 10.5 Open optimization
+
+Because the reasoner is fully frozen *and* its activations never depend on the generator, the
+understanding pathway could run once under `torch.no_grad()` rather than building an autograd
+graph that accumulates no gradients — a material activation-memory saving. It needs a
+restructured forward, so it is left open rather than done speculatively.

@@ -30,13 +30,17 @@ from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.configs.video2world.defaults.conditioner import Video2WorldCondition
 from cosmos_predict2._src.predict2.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
+from cosmos_predict2._src.predict2.camera.networks.dit_multiview_camera import (
+    CameraMiniTrainDITwithConditionalMask,
+    SACConfig as CameraSACConfig,
+)
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import SACConfig
 from cosmos_predict2._src.predict2.schedulers.rectified_flow import RectifiedFlow
 from cosmos_predict2._src.predict2.models.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 from shared.constants import (
     NUM_LATENT_FRAMES,
-    COSMOS_TOKENIZER_UUID, COSMOS_2B_PRETRAINED_UUID,
+    COSMOS_TOKENIZER_UUID, COSMOS_2B_PRETRAINED_UUID, COSMOS_2B_CAMERA_PRETRAINED_UUID,
     CR1_EMBEDDING_DIM, CR1_MAX_LENGTH,
     CROSSATTN_EMB_CHANNELS, CROSSATTN_PROJ_IN_CHANNELS,
     NUM_FRAMES,
@@ -46,6 +50,7 @@ from shared.constants import (
     XRAY_DISTANCE_RANGE, XRAY_DISTANCE_DEFAULT,
     XRAY_CAPTION_PREFIXES,
     XRAY_PROMPT_TEMPLATE,
+    XRAY_PROMPT_TEMPLATE_NO_CAMERA,
     XRAY_VIEW_MAPPING,
     NUM_XRAY_VIEWS,
 )
@@ -55,11 +60,40 @@ from renderers.diffdrr.renderer import DiffDRRVolumeRenderer
 from shared.utils import get_local_rank, get_rank, get_world_size, sync_ema_ddp, arch_invariant_rand
 
 from predict2_5.hf import hf_download as _hf_download, text_encoder_snapshot as _text_encoder_snapshot
+from predict2_5.camera_plucker import multiview_batch_camera_tensor
 
 
 # Global caches for resolved checkpoint and tokenizer paths to avoid redundant downloads across ranks.
 _CHECKPOINT_RESOLVED = {}
 _TOKENIZER_RESOLVED = {}
+
+# HF filename for each known checkpoint UUID -- the External (non-INTERNAL) _hf_download fallback
+# in _setup_network needs this per-UUID, not the single hardcoded base-checkpoint filename it had
+# before COSMOS_2B_CAMERA_PRETRAINED_UUID existed. Extend this if more checkpoints are added.
+_CHECKPOINT_HF_FILES = {
+    COSMOS_2B_PRETRAINED_UUID: "base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt",
+    COSMOS_2B_CAMERA_PRETRAINED_UUID: (
+        "robot/multiview-agibot/f740321e-2cd6-4370-bbfe-545f4eca2065_ema_bf16.pt"
+    ),
+}
+
+
+def _resolve_checkpoint_uuid(checkpoint_uuid: Optional[str], camera_cond: str) -> str:
+    """Resolve the effective checkpoint UUID to load.
+
+    ``checkpoint_uuid=None`` (the ``__init__`` default) resolves per ``camera_cond``: the
+    "plucker" arm gets the real pretrained camera-conditioned checkpoint (has ``cam_encoder``
+    weights — see ``COSMOS_2B_CAMERA_PRETRAINED_UUID``'s docstring), not the base checkpoint,
+    whose ``cam_encoder`` would otherwise silently train from a random init on every run.
+    An explicit non-``None`` value is returned as-is (an explicit ``""`` is handled by the
+    caller before this is reached — it means "no checkpoint", not "resolve one").
+
+    Pulled out of ``_setup_network`` as a standalone function so this resolution logic is
+    unit-testable without needing the full (checkpoint-downloading) module setup.
+    """
+    if checkpoint_uuid is not None:
+        return checkpoint_uuid
+    return COSMOS_2B_CAMERA_PRETRAINED_UUID if camera_cond == "plucker" else COSMOS_2B_PRETRAINED_UUID
 
 
 class CosmosXRay2XRayMultiview(LightningModule):
@@ -71,7 +105,10 @@ class CosmosXRay2XRayMultiview(LightningModule):
     def __init__(
         self,
         # ── Checkpoint & Tokenizer ──
-        checkpoint_uuid: str = COSMOS_2B_PRETRAINED_UUID,
+        # None resolves per camera_cond in _setup_network: COSMOS_2B_PRETRAINED_UUID for "text",
+        # COSMOS_2B_CAMERA_PRETRAINED_UUID (real pretrained cam_encoder weights, not random init
+        # — see docs/CONDITIONING.md §2.1) for "plucker". Pass explicitly to override either way.
+        checkpoint_uuid: Optional[str] = None,
         tokenizer_uuid: str = COSMOS_TOKENIZER_UUID,
         checkpoint_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
@@ -120,12 +157,21 @@ class CosmosXRay2XRayMultiview(LightningModule):
         views_per_batch: int = 2,
         view_loss_weights: bool = False,
         prefer_difficult_views: bool = False,
+        # ── Camera conditioning ablation ──
+        # "text": baseline — azimuth/elevation formatted into the prompt, tokenized by CR1.
+        # "plucker": camera geometry as per-token Plücker ray embeddings, added directly to
+        #   spatial tokens in every block via CameraMiniTrainDITwithConditionalMask (see
+        #   _create_dit, denoise, predict2_5/camera_plucker.py). Also switches the prompt to
+        #   XRAY_PROMPT_TEMPLATE_NO_CAMERA so the two arms differ in exactly one variable —
+        #   how camera geometry reaches the model, not what else the prompt says.
+        camera_cond: Literal["text", "plucker"] = "text",
     ):
         """
         Initialise the Cosmos-Predict 2.5 multiview X-ray synthesis module.
 
         Args:
-            checkpoint_uuid: GCS/HF UUID for the pretrained DiT checkpoint.
+            checkpoint_uuid: GCS/HF UUID for the pretrained DiT checkpoint. None resolves per
+                camera_cond (see the parameter's own comment above).
             tokenizer_uuid: GCS/HF UUID for the Wan2pt1 VAE tokenizer.
             checkpoint_path: Local path override (skips HF download).
             tokenizer_path: Local path override (skips HF download).
@@ -169,6 +215,9 @@ class CosmosXRay2XRayMultiview(LightningModule):
 
         # Save all hyperparameters to ``self.hparams`` for easy access and checkpointing.
         self.save_hyperparameters()
+
+        if camera_cond not in ("text", "plucker"):
+            raise ValueError(f"camera_cond must be 'text' or 'plucker', got {camera_cond!r}")
 
         # Initialize per-view difficulty weights for loss weighting
         self._init_view_weights()
@@ -279,14 +328,27 @@ class CosmosXRay2XRayMultiview(LightningModule):
 
     def _create_dit(self, device: str = "meta") -> MinimalV1LVGDiT:
         """
-        Instantiate the DiT network
+        Instantiate the DiT network.
+
+        When ``hparams.camera_cond == "plucker"``, constructs
+        ``CameraMiniTrainDITwithConditionalMask`` instead of the baseline ``MinimalV1LVGDiT``.
+        Every base kwarg below carries over unchanged (the two share the same
+        ``max_img_h``/``in_channels``/``model_channels``/... constructor surface — see
+        ``cosmos_predict2._src.predict2.camera.configs.multiview_camera.net``'s
+        ``CAMERA_COSMOS_V1_2B_NET_MININET`` for NVIDIA's own matching 2B config); no extra
+        kwargs are needed here, since Plücker's per-block ``cam_dim=1536`` is a
+        `Block`-internal default (see ``predict2_5/camera_plucker.py``'s
+        ``PLUCKER_CHANNELS``), not exposed at this constructor level. The Plücker variant
+        adds a per-token camera embedding directly to spatial tokens in every block (see
+        :meth:`denoise`'s ``camera=`` handling), rather than through the cross-attention text
+        embeddings the baseline uses exclusively.
 
         Args:
             device: Torch device string. Use ``"meta"`` for lazy allocation
                     (memory-efficient; call ``.to_empty()`` before weight loading).
 
         Returns:
-            Freshly constructed ``MinimalV1LVGDiT`` with all layers on *device*.
+            Freshly constructed DiT with all layers on *device*.
         """
         # Get the architecture config for the selected model size
         config = self._get_model_config()
@@ -296,34 +358,46 @@ class CosmosXRay2XRayMultiview(LightningModule):
         try:
             from cosmos_predict2._src.imaginaire.utils import log as _cl
             _cl.logger.disable("cosmos_predict2._src.predict2.networks.minimal_v4_dit")
+            _cl.logger.disable("cosmos_predict2._src.predict2.camera.networks.dit_multiview_camera")
         except Exception:
             _cl = None
 
+        dit_cls = MinimalV1LVGDiT
+        # dit_multiview_camera.py defines its own SACConfig subclass (same base class, but a
+        # distinct type with its own get_context_fn override) — use the one matching the
+        # class actually being constructed rather than assuming the two are interchangeable.
+        sac_config_cls = SACConfig
+        if self.hparams.camera_cond == "plucker":
+            dit_cls = CameraMiniTrainDITwithConditionalMask
+            sac_config_cls = CameraSACConfig
+
+        dit_kwargs = dict(
+            max_img_h=240, max_img_w=240, max_frames=128,
+            in_channels=self.hparams.state_ch,
+            out_channels=self.hparams.state_ch,
+            patch_spatial=2, patch_temporal=1,
+            concat_padding_mask=True,
+            model_channels=config["model_channels"],
+            num_blocks=config["num_blocks"],
+            num_heads=config["num_heads"],
+            atten_backend="minimal_a2a",
+            pos_emb_cls="rope3d",
+            pos_emb_learnable=True,
+            pos_emb_interpolation="crop",
+            use_adaln_lora=True, adaln_lora_dim=256,
+            rope_h_extrapolation_ratio=3.0,
+            rope_w_extrapolation_ratio=3.0,
+            rope_t_extrapolation_ratio=1.0,
+            crossattn_emb_channels=CROSSATTN_EMB_CHANNELS,
+            use_crossattn_projection=True,
+            crossattn_proj_in_channels=CROSSATTN_PROJ_IN_CHANNELS,
+            sac_config=sac_config_cls(mode="mm_only"),
+            timestep_scale=0.001,
+        )
+
         # Build the DiT on the specified device; "meta" defers memory allocation until weight loading
         with torch.device(device):
-            net = MinimalV1LVGDiT(
-                max_img_h=240, max_img_w=240, max_frames=128,
-                in_channels=self.hparams.state_ch,
-                out_channels=self.hparams.state_ch,
-                patch_spatial=2, patch_temporal=1,
-                concat_padding_mask=True,
-                model_channels=config["model_channels"],
-                num_blocks=config["num_blocks"],
-                num_heads=config["num_heads"],
-                atten_backend="minimal_a2a",
-                pos_emb_cls="rope3d",
-                pos_emb_learnable=True,
-                pos_emb_interpolation="crop",
-                use_adaln_lora=True, adaln_lora_dim=256,
-                rope_h_extrapolation_ratio=3.0,
-                rope_w_extrapolation_ratio=3.0,
-                rope_t_extrapolation_ratio=1.0,
-                crossattn_emb_channels=CROSSATTN_EMB_CHANNELS,
-                use_crossattn_projection=True,
-                crossattn_proj_in_channels=CROSSATTN_PROJ_IN_CHANNELS,
-                sac_config=SACConfig(mode="mm_only"),
-                timestep_scale=0.001,
-            )
+            net = dit_cls(**dit_kwargs)
 
         return net
 
@@ -382,8 +456,15 @@ class CosmosXRay2XRayMultiview(LightningModule):
         # Resolve the checkpoint path
         if self.hparams.checkpoint_path:
             checkpoint_path = self.hparams.checkpoint_path
-        elif self.hparams.checkpoint_uuid:
-            uuid = self.hparams.checkpoint_uuid
+        elif self.hparams.checkpoint_uuid != "":
+            uuid = _resolve_checkpoint_uuid(self.hparams.checkpoint_uuid, self.hparams.camera_cond)
+            if uuid not in _CHECKPOINT_HF_FILES:
+                raise ValueError(
+                    f"No known HF filename for checkpoint_uuid={uuid!r} — add it to "
+                    "_CHECKPOINT_HF_FILES, or pass checkpoint_path directly."
+                )
+            hf_filename = _CHECKPOINT_HF_FILES[uuid]
+
             if uuid not in _CHECKPOINT_RESOLVED:
                 # All ranks resolve the checkpoint path independently.
                 # _hf_download uses a per-file filelock so concurrent calls are safe.
@@ -399,14 +480,14 @@ class CosmosXRay2XRayMultiview(LightningModule):
                             )
                         _CHECKPOINT_RESOLVED[uuid] = _hf_download(
                             repo_id="nvidia/Cosmos-Predict2.5-2B",
-                            filename="base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt",
+                            filename=hf_filename,
                         )
                 else:
                     if get_local_rank() == 0:
                         log.info("[Setup] External mode (INTERNAL=False): downloading checkpoint from HuggingFace …")
                     _CHECKPOINT_RESOLVED[uuid] = _hf_download(
                         repo_id="nvidia/Cosmos-Predict2.5-2B",
-                        filename="base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt",
+                        filename=hf_filename,
                     )
             checkpoint_path = _CHECKPOINT_RESOLVED[uuid]
 
@@ -863,6 +944,11 @@ class CosmosXRay2XRayMultiview(LightningModule):
         Returns:
             Nested list: outer list per view, inner list per batch sample within that view.
         """
+        # When camera geometry is conditioned via per-token Plücker rays (see _create_dit),
+        # strip its numerics from the prompt so the two camera_cond arms differ in exactly
+        # one variable — how the geometry reaches the model, not what else the prompt says.
+        template = XRAY_PROMPT_TEMPLATE_NO_CAMERA if self.hparams.camera_cond == "plucker" else XRAY_PROMPT_TEMPLATE
+
         all_prompts = []
         for vp in all_view_params:
             view_name = vp["view_name"]
@@ -871,7 +957,7 @@ class CosmosXRay2XRayMultiview(LightningModule):
             view_prompts = []
 
             for i in range(B):
-                prompt = XRAY_PROMPT_TEMPLATE.format(
+                prompt = template.format(
                     prefix=prefix,
                     azimuth=vp["azimuth"][i].item(),
                     elevation=vp["elevation"][i].item(),
@@ -947,6 +1033,8 @@ class CosmosXRay2XRayMultiview(LightningModule):
                 - text_embeddings: Encoded text prompts for all samples
                 - view_indices: View index per sample
                 - camera_params: Camera extrinsics/intrinsics for each sample
+                - camera_plucker: (B*V, NUM_LATENT_FRAMES, 16, 16, 1536) per-token Plücker
+                  ray tensor, only when hparams.camera_cond == "plucker"; None otherwise
                 - prompts: Raw prompt strings
                 - frontal_xray: Reference X-ray images
                 - target_xray: Target X-ray images for each view
@@ -999,11 +1087,29 @@ class CosmosXRay2XRayMultiview(LightningModule):
         # Encode all concatenated prompts to conditioning embeddings in one batch call
         text_embeddings = self._encode_prompts(prompts_flat)
 
+        # Only computed for the "plucker" arm — skip entirely on the "text" baseline where
+        # nothing would consume the result.
+        camera_plucker = None
+        if self.hparams.camera_cond == "plucker":
+            camera_plucker = multiview_batch_camera_tensor(
+                anchor_azimuth=torch.zeros_like(cam_all["azimuth"]).to(device=self.device),
+                anchor_elevation=torch.zeros_like(cam_all["elevation"]).to(device=self.device),
+                target_azimuth=cam_all["azimuth"].to(device=self.device),
+                target_elevation=cam_all["elevation"].to(device=self.device),
+                distance=cam_all["distance"].to(device=self.device),
+                fov=cam_all["fov"].to(device=self.device),
+                max_depth=self.hparams.renderer_max_depth,
+                ndc_extent=self.hparams.renderer_ndc_extent,
+                num_frontal_pixel_frames=self.hparams.num_frontal_frames,
+                device=self.device,
+            )
+
         return {
             "video": video_all,
             "text_embeddings": text_embeddings,
             "view_indices": view_indices_all,
             "camera_params": cam_all,
+            "camera_plucker": camera_plucker,
             "prompts": prompts_flat,
             "frontal_xray": frontal_all,
             "target_xray": target_all,
@@ -1121,6 +1227,7 @@ class CosmosXRay2XRayMultiview(LightningModule):
         xt_B_C_T_H_W: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         condition: Video2WorldCondition,
+        camera: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Run one forward pass of the DiT denoising network.
@@ -1135,6 +1242,12 @@ class CosmosXRay2XRayMultiview(LightningModule):
             xt_B_C_T_H_W: Noisy latent at the current diffusion timestep ``(B, C, T, H, W)``.
             timesteps_B_T: Discrete timestep index tensor, shape ``(B, 1)``.
             condition: :class:`Video2WorldCondition` created by :meth:`_get_condition`.
+            camera: ``(B, NUM_LATENT_FRAMES, 16, 16, 1536)`` per-token Plücker ray tensor,
+                required (and only accepted) when ``self.net`` is
+                ``CameraMiniTrainDITwithConditionalMask`` (``hparams.camera_cond ==
+                "plucker"``) — see :meth:`_create_dit` and ``predict2_5/camera_plucker.py``.
+                The baseline ``MinimalV1LVGDiT.forward`` has no ``camera`` parameter, so this
+                must stay ``None`` on the "text" arm.
 
         Returns:
             Predicted velocity field as a ``float32`` tensor ``(B, C, T, H, W)``.
@@ -1174,10 +1287,22 @@ class CosmosXRay2XRayMultiview(LightningModule):
                     timesteps_B_T = timesteps_B_T.unsqueeze(0)
 
         # Forward pass through the DiT to get the predicted velocity field
+        net_kwargs = condition.to_dict()
+        if camera is not None:
+            if self.hparams.camera_cond != "plucker":
+                raise ValueError("`camera` was provided but hparams.camera_cond != 'plucker'.")
+            # CameraMiniTrainDITwithConditionalMask.forward() expects camera already shaped
+            # (B, T, H, W, 1536) to broadcast-add against its own (B, T, H, W, model_dim)
+            # token grid — exactly what multiview_batch_camera_tensor produces, no reshape
+            # needed here (unlike the rejected AdaLN-action approach's (B,1,D) reshape).
+            net_kwargs["camera"] = camera.to(device=self.device, dtype=model_dtype)
+        elif self.hparams.camera_cond == "plucker":
+            raise ValueError("hparams.camera_cond == 'plucker' requires `camera` to be provided.")
+
         net_out = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(device=self.device, dtype=model_dtype),
             timesteps_B_T=timesteps_B_T.to(device=self.device, dtype=model_dtype),
-            **condition.to_dict(),
+            **net_kwargs,
         ).float()
 
         # Replace conditioned-frame predictions with GT velocity for exact reconstruction
@@ -1410,7 +1535,8 @@ class CosmosXRay2XRayMultiview(LightningModule):
         mean_cond = cond_mask[:, 0, :, 0, 0].sum(dim=1).mean().item()
 
         vt_pred = self.denoise(noise=epsilon, xt_B_C_T_H_W=xt,
-                               timesteps_B_T=timesteps, condition=condition)
+                               timesteps_B_T=timesteps, condition=condition,
+                               camera=result["camera_plucker"])
 
         # Compute time-weighted MSE loss
         time_w = self.rectified_flow.train_time_weight(timesteps, tk)
@@ -1486,7 +1612,8 @@ class CosmosXRay2XRayMultiview(LightningModule):
         # Forward pass under EMA weights (rank 0) for a cleaner loss signal
         with self.ema_scope():
             vt_pred = self.denoise(noise=epsilon, xt_B_C_T_H_W=xt,
-                                   timesteps_B_T=timesteps, condition=condition)
+                                   timesteps_B_T=timesteps, condition=condition,
+                                   camera=result["camera_plucker"])
 
         # Compute time-weighted MSE loss
         time_w = self.rectified_flow.train_time_weight(timesteps, tk)
@@ -1585,10 +1712,15 @@ class CosmosXRay2XRayMultiview(LightningModule):
                 "fov": fov_mid,
             }
 
-        # Build text description for the target view
+        # Build text description for the target view — matches training's template choice
+        # (see _generate_multiview_prompts): drop camera numerics from the prompt on the
+        # "plucker" arm, since geometry reaches the model through per-token rays instead.
         if prompt is None:
             prefix = XRAY_CAPTION_PREFIXES[view_name]
-            prompt = XRAY_PROMPT_TEMPLATE.format(
+            template = (
+                XRAY_PROMPT_TEMPLATE_NO_CAMERA if self.hparams.camera_cond == "plucker" else XRAY_PROMPT_TEMPLATE
+            )
+            prompt = template.format(
                 prefix=prefix,
                 azimuth=camera_params["azimuth"],
                 elevation=camera_params["elevation"],
@@ -1599,6 +1731,24 @@ class CosmosXRay2XRayMultiview(LightningModule):
             )
 
         text_embeddings = self._encode_prompts([prompt])
+
+        camera = None
+        if self.hparams.camera_cond == "plucker":
+            azimuth_t = torch.tensor([camera_params["azimuth"]], device=self.device, dtype=torch.float32)
+            elevation_t = torch.tensor([camera_params["elevation"]], device=self.device, dtype=torch.float32)
+            distance_t = torch.tensor([camera_params["distance"]], device=self.device, dtype=torch.float32)
+            fov_t = torch.tensor([camera_params["fov"]], device=self.device, dtype=torch.float32)
+            camera = multiview_batch_camera_tensor(
+                anchor_azimuth=torch.zeros_like(azimuth_t),
+                anchor_elevation=torch.zeros_like(elevation_t),
+                target_azimuth=azimuth_t,
+                target_elevation=elevation_t,
+                distance=distance_t,
+                fov=fov_t,
+                max_depth=self.hparams.renderer_max_depth,
+                ndc_extent=self.hparams.renderer_ndc_extent,
+                num_frontal_pixel_frames=self.hparams.num_frontal_frames,
+            ).to(device=self.device)
 
         # Resolve generation hyperparameters, falling back to hparams defaults
         num_steps = num_steps or self.hparams.num_inference_steps
@@ -1680,9 +1830,12 @@ class CosmosXRay2XRayMultiview(LightningModule):
             for i, t in enumerate(timesteps):
                 ts = t.view(1, 1).expand(B, 1)
 
-                # Conditional and unconditional velocity predictions for CFG
-                v_cond = self.denoise(initial_noise, latents, ts, condition)
-                v_uncond = self.denoise(initial_noise, latents, ts, uncondition)
+                # Conditional and unconditional velocity predictions for CFG. Plücker camera
+                # conditioning is NOT dropped for the unconditional pass — CFG here only
+                # ablates text, and the camera pathway has no dropout of its own (training_step
+                # never zeros `camera`).
+                v_cond = self.denoise(initial_noise, latents, ts, condition, camera=camera)
+                v_uncond = self.denoise(initial_noise, latents, ts, uncondition, camera=camera)
                 vel = v_uncond + guidance_scale * (v_cond - v_uncond)
 
                 latents = self.sample_scheduler.step(

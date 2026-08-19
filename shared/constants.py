@@ -51,6 +51,14 @@ FRAME_WIDTH = IMG_WIDTH
 COSMOS_TOKENIZER_UUID = "685afcaa-4de2-42fe-b7b9-69f7a2dee4d8"
 COSMOS_2B_PRETRAINED_UUID = "d20b7120-df3e-4911-919d-db6e08bad31c"
 COSMOS_REASON_UUID = "cb3e3ffa-7b08-4c34-822d-61c7aa31a14f"
+
+# Camera-conditioned 2B checkpoint (AgiBot multiview, includes pretrained `cam_encoder` weights
+# for CameraMiniTrainDITwithConditionalMask's Plucker-ray port) -- verified real and present via
+# a ranged fetch of the checkpoint's pickle header (28 `net.blocks.{N}.cam_encoder.weight`
+# tensors; byte-size delta matches 1536*2048*28 bf16 params to 0.06%), see docs/CONDITIONING.md
+# §2.1. Domain caveat: trained on AgiBot robot footage, not X-ray -- the geometric prior
+# (Plucker ray -> viewpoint) transfers, the appearance prior does not.
+COSMOS_2B_CAMERA_PRETRAINED_UUID = "f740321e-2cd6-4370-bbfe-545f4eca2065"
 T5_11B_UUID = "4dbf13c6-1d30-4b02-99d6-75780dd8b744"
 
 # ============================================================
@@ -145,6 +153,28 @@ XRAY_PROMPT_TEMPLATE: Final[str] = (
     " they are accumulated via a weighted ray-projection integral along each diverging ray"
     " from source depth {znear:.2f} to {zfar:.2f} (scene units),"
     " a window that fully brackets the isocenter at depth {distance:.2f}."
+    " The projection is normalised by its maximum so the densest structure maps to white:"
+    " cortical bone and calcifications are bright white;"
+    " soft tissue — myocardium, great vessels, diaphragm — renders as intermediate grays;"
+    " air-filled alveolar lung parenchyma has near-zero accumulated density and appears dark."
+    " The output is strictly monochrome grayscale — not a color photograph, not an MRI,"
+    " and free of motion blur or film grain."
+)
+
+# Camera-free variant of XRAY_PROMPT_TEMPLATE, used by the `camera_cond="embed"` ablation arm
+# (predict2_5/camera_embed.py). Identical prose minus the numeric geometry (azimuth, elevation,
+# distance, fov, znear/zfar), so the only difference between arms is *how* camera geometry
+# reaches the model, not what else the prompt says. The per-view anatomical prefix is kept --
+# it is legitimate view description, not camera numerics.
+XRAY_PROMPT_TEMPLATE_NO_CAMERA: Final[str] = (
+    "{prefix}"
+    " This is a grayscale digitally reconstructed radiograph (DRR) computed by"
+    " object-centric diverging-ray forward projection of a 3D CT volume."
+    " The thoracic CT volume is fixed at the world origin (isocenter);"
+    " the virtual point X-ray source orbits around it on a cone-beam trajectory."
+    " CT Hounsfield-unit voxel values serve as linear attenuation proxies:"
+    " they are accumulated via a weighted ray-projection integral along each diverging ray,"
+    " over a depth window that fully brackets the isocenter."
     " The projection is normalised by its maximum so the densest structure maps to white:"
     " cortical bone and calcifications are bright white;"
     " soft tissue — myocardium, great vessels, diaphragm — renders as intermediate grays;"

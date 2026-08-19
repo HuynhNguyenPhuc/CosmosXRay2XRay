@@ -1007,7 +1007,13 @@ class CosmosXRay2XRayTransferMultiview(LightningModule):
                 if latent_control_input is not None
                 else torch.zeros(B, C, T, H, W, device=self.device, dtype=model_dtype)
             ),
-            "control_context_scale": self.hparams.control_context_scale,
+            # MinimalV4LVGControlVaceDiT.forward() unconditionally does
+            # `control_context_scale = control_context_scale[0]` on the single-control-branch
+            # path (num_control_branches == 1, our config) before any isinstance/type check —
+            # despite its own type hint saying `float | torch.Tensor`. A bare float crashes
+            # with `TypeError: 'float' object is not subscriptable` on every forward call, so
+            # this must be passed as a length-1 sequence.
+            "control_context_scale": [self.hparams.control_context_scale],
         }
         # Pass through optional condition fields
         for key in ("condition_video_input_mask_B_C_T_H_W", "fps", "padding_mask",

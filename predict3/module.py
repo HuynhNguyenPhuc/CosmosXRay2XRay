@@ -46,10 +46,11 @@ from predict3.camera import (
     PoseConvention,
     orbit_view_matrices,
     pad_actions_to_model_dim,
-    poses_to_camera_pose_actions,
+    poses_to_relative_actions,
 )
 from predict3.constants import COSMOS3_EDGE_REPO_ID, COSMOS3_LATENT_CHANNELS
 from predict3.hf import load_scheduler_config, load_transformer_config, load_vae_config
+from predict3.tower import freeze_reasoner_tower
 from shared.constants import NUM_FRAMES, VOL_SIZE
 from shared.utils import get_logger
 
@@ -76,6 +77,7 @@ class CosmosXRay2XRayPredict3Multiview(LightningModule):
         use_camera_action: bool = True,
         camera_pose_convention: PoseConvention = "backward_anchored",
         num_hidden_layers_override: int | None = None,
+        freeze_reasoner: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -159,6 +161,11 @@ class CosmosXRay2XRayPredict3Multiview(LightningModule):
             self.transformer = self._pipeline.transformer
             self.vae = self._pipeline.vae
             self.vae.requires_grad_(False)
+            if self.hparams.freeze_reasoner:
+                # Post-train the DM Generator tower only; keep the causal AR Reasoner's
+                # language/reasoning prior intact. See predict3/tower.py for the verified
+                # und/gen parameter split.
+                self._freeze_summary = freeze_reasoner_tower(self.transformer)
 
     # ------------------------------------------------------------------
     # Conditioning helpers
@@ -191,7 +198,7 @@ class CosmosXRay2XRayPredict3Multiview(LightningModule):
             poses = batch.get("camera_poses")
             if poses is None:
                 poses = orbit_view_matrices(num_pixel_frames)
-            actions = poses_to_camera_pose_actions(
+            actions = poses_to_relative_actions(
                 poses, pose_convention=self.hparams.camera_pose_convention
             )
 
@@ -336,8 +343,12 @@ class CosmosXRay2XRayPredict3Multiview(LightningModule):
         return {"loss": loss}
 
     def configure_optimizers(self):
+        # Only generator-side parameters when the reasoner is frozen. Handing AdamW frozen
+        # params would allocate optimizer state for weights that never receive a gradient —
+        # ~2 extra fp32 tensors per frozen parameter, for nothing.
+        params = [p for p in self.transformer.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
-            self.transformer.parameters(),
+            params,
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
         )

@@ -18,6 +18,7 @@ Welcome to the comprehensive documentation suite for **CosmosXRay2XRay**. This i
 | **[GOTCHAS.md](./GOTCHAS.md)** | Technical & Physical Pitfalls | Submodule CUDA builds, VAE latent frame constraints, DDP EMA sync, and memory optimization. |
 | **[PROPOSAL.md](./PROPOSAL.md)** | Project Roadmap & Milestones | Strategic goals, deliverables, and conference submission targets. |
 | **[REVIEWS.md](./REVIEWS.md)** | Quality Assurance & Peer Review | Submission readiness checklists, ablation criteria, and review guidelines. |
+| **[CONDITIONING.md](./CONDITIONING.md)** | Conditioning Ports by Backbone | Which signal goes through which port for Predict 2.5 / Transfer 2.5 / Cosmos 3; Plücker rays vs. `camera_pose` actions; reasoner-freeze policy. |
 | **[cosmos-predict3/PLAN.md](./cosmos-predict3/PLAN.md)** | Cosmos 3 Migration & `predict3/` Scaffolding | Architecture deltas vs. Predict 2.5/Transfer 2.5, real backbone verification, native I2V design, separate-venv requirement, what's not done yet. |
 
 ---

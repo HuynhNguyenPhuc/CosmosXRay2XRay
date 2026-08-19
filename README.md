@@ -444,4 +444,6 @@ Camera distance range: 7.0–9.0 units, FOV: 25°–35°.
 
 ## License
 
-This project uses NVIDIA Cosmos 2.5 components. See [cosmos-predict2.5/LICENSE](cosmos-predict2.5/LICENSE) and [cosmos-transfer2.5/LICENSE](cosmos-transfer2.5/LICENSE) for their respective licenses.
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+It also integrates NVIDIA Cosmos 2.5 components. See [cosmos-predict2.5/LICENSE](cosmos-predict2.5/LICENSE) and [cosmos-transfer2.5/LICENSE](cosmos-transfer2.5/LICENSE) for third-party component licenses.

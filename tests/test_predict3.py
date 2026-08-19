@@ -32,6 +32,7 @@ from predict3.camera import (
 )
 from predict3.constants import COSMOS3_EDGE_REPO_ID
 from predict3.module import CosmosXRay2XRayPredict3Multiview
+from predict3.tower import is_generator_param
 from predict3.trainer import Predict3Config, smoke_test
 from shared.constants import XRAY_CAMERAS
 
@@ -135,3 +136,67 @@ def test_camera_action_conditioning_reaches_action_pathway():
     assert without_action == set()
     # All action tokens are conditioning (never denoised), so the output head must stay unused.
     assert not any("action_proj_out" in n for n in with_action)
+
+
+def test_reasoner_frozen_generator_trainable():
+    """Only the DM Generator tower trains; the AR Reasoner tower stays frozen.
+
+    Checks the classification against the real parameter names, and asserts the partition is
+    total — every parameter is on exactly one side, so a renamed module upstream surfaces as a
+    failure here rather than as silently-untrained weights.
+    """
+    model = CosmosXRay2XRayPredict3Multiview(num_hidden_layers_override=TEST_LAYERS)
+    model.setup()
+
+    trainable = {n for n, p in model.transformer.named_parameters() if p.requires_grad}
+    frozen = {n for n, p in model.transformer.named_parameters() if not p.requires_grad}
+
+    assert trainable and frozen
+    assert trainable.isdisjoint(frozen)
+
+    # Reasoner: text embedding, LM head, understanding-stream norm and per-layer twins.
+    assert "embed_tokens.weight" in frozen
+    assert "lm_head.weight" in frozen
+    assert "norm.weight" in frozen
+    assert "layers.0.mlp.up_proj.weight" in frozen
+    assert "layers.0.self_attn.to_q.weight" in frozen
+    assert "layers.0.input_layernorm.weight" in frozen
+
+    # Generator: latent projections, timestep embedder, action ports, `_moe_gen` twins and
+    # the added-stream attention projections.
+    assert "proj_in.weight" in trainable
+    assert "proj_out.weight" in trainable
+    assert "norm_moe_gen.weight" in trainable
+    assert "time_embedder.linear_1.weight" in trainable
+    assert "action_proj_in.fc.weight" in trainable
+    assert "layers.0.mlp_moe_gen.up_proj.weight" in trainable
+    assert "layers.0.self_attn.add_q_proj.weight" in trainable
+    assert "layers.0.input_layernorm_moe_gen.weight" in trainable
+    # Consumed only by the generation pathway (`all_k = cat([k_und_for_gen, k_gen])`).
+    assert "layers.0.self_attn.k_norm_und_for_gen.weight" in trainable
+
+
+def test_frozen_reasoner_receives_no_gradients():
+    """requires_grad=False alone is weak evidence — prove no reasoner param accumulates a
+    gradient through a real backward pass, and that the optimizer excludes them."""
+    model = CosmosXRay2XRayPredict3Multiview(num_hidden_layers_override=TEST_LAYERS)
+    model.setup()
+    video = torch.rand(1, 3, 5, 32, 32)
+    model.training_step({"video": video, "prompt": "test"}, batch_idx=0)["loss"].backward()
+
+    got_grad = {n for n, p in model.transformer.named_parameters() if p.grad is not None}
+    assert got_grad, "backward produced no gradients at all"
+    assert all(is_generator_param(n) for n in got_grad)
+
+    optimizer_params = {id(p) for p in model.configure_optimizers().param_groups[0]["params"]}
+    frozen_ids = {id(p) for _, p in model.transformer.named_parameters() if not p.requires_grad}
+    assert optimizer_params.isdisjoint(frozen_ids)
+
+
+def test_freeze_can_be_disabled():
+    """The freeze is a flag, not a hard-coded policy — full fine-tuning stays available."""
+    model = CosmosXRay2XRayPredict3Multiview(
+        freeze_reasoner=False, num_hidden_layers_override=TEST_LAYERS
+    )
+    model.setup()
+    assert all(p.requires_grad for p in model.transformer.parameters())
